@@ -405,6 +405,14 @@
   .sp-go{pointer-events:auto;margin-top:40px}
   #splash.idle .sp-go{animation:spStart .9s ease-in-out infinite alternate}
   #splash.idle .sp-breathe{animation:spBreathe 2.2s ease-in-out infinite alternate}
+  /* ------------------------------------------------- mobile perf tier (html.mperf = PERF.mobile; desktop never) */
+  html.mperf body::before{filter:none}                       /* letterbox: a tiny pre-darkened plate, upscaled = blurred */
+  html.mperf .cell{transition:opacity .25s}                  /* dim switches at once: no filter transition repaint */
+  html.mperf .cell.pop img{filter:brightness(1.12)}          /* no drop-shadow on the pulsing winners (the rim glows) */
+  html.mperf .lf-surf{filter:none}
+  html.mperf .lock svg{filter:none}
+  .bglow{position:absolute;pointer-events:none;border-radius:50%;opacity:0;
+    background:radial-gradient(closest-side,rgba(255,220,140,.9),rgba(255,122,26,.55) 45%,rgba(255,80,0,0) 100%)}
   @keyframes spStart{from{transform:scale(1)}to{transform:scale(1.06)}}
   @keyframes spBreathe{from{transform:scale(1)}to{transform:scale(1.04)}}
 </style>
@@ -1127,6 +1135,17 @@ if (/Apple/.test(navigator.vendor || '')) document.documentElement.classList.add
 const CALM_FX = () => !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 const COARSE = !!(window.matchMedia && window.matchMedia('(pointer:coarse)').matches);
 document.documentElement.classList.toggle('coarse', COARSE);
+/* PERF tier, decided ONCE at load. PERF.mobile = phones / tablets (touch-first small screens, iOS / iPadOS, or a
+   touch device reporting <= 4 GB): cheaper effects (see README "Mobile perf tier"). Every mobile-only path is gated
+   on it; desktop (PERF.mobile false) runs exactly the v9 code paths. */
+const PERF = (() => {
+  const ua = navigator.userAgent || '', touch = (navigator.maxTouchPoints || 0) > 0;
+  const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+  const small = Math.min(screen.width || 0, screen.height || 0) <= 1024;
+  const lowMem = touch && navigator.deviceMemory != null && navigator.deviceMemory <= 4;
+  return { mobile: !!((COARSE && small) || ios || lowMem) };
+})();
+document.documentElement.classList.toggle('mperf', PERF.mobile);
 const QA_BUILD = false;                // build.mjs: true in the -qa build, false in the release build (no outcome hooks)
 (function () {                                   // font: inlined Roboto (falls back to system sans)
   const u = asset('roboto.woff2');
@@ -1485,6 +1504,7 @@ function landFx(r, col) {
   ks.forEach((k) => {
     const c = visCell(r, k); if (!c) return;
     const glow = col[k] === SCAT ? '#ff7a1a' : '#a8f0ff';
+    if (PERF.mobile) { c.animate([{ filter: 'brightness(1)' }, { filter: 'brightness(1.6)', offset: 0.25 }, { filter: 'brightness(1)' }], { duration: 600, easing: 'ease-out' }); return; }
     c.animate([{ filter: `brightness(1) drop-shadow(0 0 0 ${glow})` }, { filter: `brightness(1.6) drop-shadow(0 0 26px ${glow})`, offset: 0.25 },
       { filter: `brightness(1) drop-shadow(0 0 0 ${glow})` }], { duration: 600, easing: 'ease-out' });
   });
@@ -1542,8 +1562,10 @@ async function rollSet(grid, reels) {
    px. Glow dots are pre-rendered sprites drawn additively; the loop runs only while particles exist; capped on phones. */
 const PFX = (() => {
   const cv = $('pfx'), g = cv.getContext('2d');
-  const CAP = COARSE ? 100 : 420;
+  const CAP = PERF.mobile ? 70 : COARSE ? 100 : 420;
+  const MQ = 0.5;                                     // mobile: canvas px per stage px cap (soft glows read fine)
   const parts = [];
+  let box = null;                                     // mobile: last frame's drawn bounds [x0, y0, x1, y1] in canvas px
   let running = false, last = 0, q = 1, W = 1920, H = 1072, ft = 16;   // ft: smoothed frame time (ms)
   const SPR = {};
   function sprite(key, c1, c2) {
@@ -1560,7 +1582,8 @@ const PFX = (() => {
   function sync() {
     const sw = stage.offsetWidth || 1920, sh = stage.offsetHeight || 1072;
     const m = /scale\(([\d.]+)\)/.exec(stage.style.transform || ''), s = m ? +m[1] : 1;
-    const nq = Math.max(0.5, Math.min(1, s * (window.devicePixelRatio || 1)));
+    let nq = Math.max(0.5, Math.min(1, s * (window.devicePixelRatio || 1)));
+    if (PERF.mobile) nq = Math.min(nq, MQ);
     if (sw !== W || sh !== H || nq !== q || cv.width !== Math.round(sw * nq) || cv.height !== Math.round(sh * nq)) { W = sw; H = sh; q = nq; cv.width = Math.round(W * q); cv.height = Math.round(H * q); }
     Object.assign(cv.style, { width: W + 'px', height: H + 'px', transform: stage.style.transform });
   }
@@ -1572,7 +1595,9 @@ const PFX = (() => {
   }
   function loop(now) {
     const dt = Math.min(0.05, (now - last) / 1000); ft = ft * 0.9 + (now - last) * 0.1; last = now;
-    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, cv.width, cv.height);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    if (!PERF.mobile) g.clearRect(0, 0, cv.width, cv.height);
+    else { if (box) g.clearRect(box[0], box[1], box[2] - box[0], box[3] - box[1]); box = null; }   // clear only what was drawn
     g.setTransform(q, 0, 0, q, 0, 0);
     for (let i = parts.length - 1; i >= 0; i--) {
       const p = parts[i];
@@ -1580,9 +1605,19 @@ const PFX = (() => {
       if (!p.step(p, dt)) { parts.splice(i, 1); if (p.done) p.done(); continue; }
       g.globalCompositeOperation = p.comp || 'lighter';
       p.draw(p);
+      if (PERF.mobile) grow(p);
     }
     if (parts.length) requestAnimationFrame(loop);
-    else { running = false; g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, cv.width, cv.height); }
+    else { running = false; box = null; g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, cv.width, cv.height); }
+  }
+  // mobile dirty bounds: every particle reports a generous box around itself (trails: their whole polyline)
+  function grow(p) {
+    let x0 = p.x, y0 = p.y, x1 = p.x, y1 = p.y;
+    if (p.trail) for (const t of p.trail) { if (t[0] < x0) x0 = t[0]; if (t[0] > x1) x1 = t[0]; if (t[1] < y0) y0 = t[1]; if (t[1] > y1) y1 = t[1]; }
+    const m = (p.r || 30) * 2 + 24;
+    const b = [Math.max(0, Math.floor((x0 - m) * q)), Math.max(0, Math.floor((y0 - m) * q)), Math.min(cv.width, Math.ceil((x1 + m) * q)), Math.min(cv.height, Math.ceil((y1 + m) * q))];
+    if (b[2] <= b[0] || b[3] <= b[1]) return;
+    if (!box) box = b; else { box[0] = Math.min(box[0], b[0]); box[1] = Math.min(box[1], b[1]); box[2] = Math.max(box[2], b[2]); box[3] = Math.max(box[3], b[3]); }
   }
   const dot = (key, x, y, r, a) => { g.globalAlpha = Math.max(0, Math.min(1, a)); g.drawImage(SPR[key] || SPR.lava, x - r, y - r, 2 * r, 2 * r); g.globalAlpha = 1; };
   const ballistic = (p, dt) => { p.vx *= 1 - p.drag * dt; p.vy = p.vy * (1 - p.drag * dt) + p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt; return p.age < p.life; };
@@ -1600,6 +1635,10 @@ const PFX = (() => {
         draw: (p) => { const k = 1 - p.age / p.life; dot(p.key, p.x, p.y, p.r * (0.4 + 0.6 * k), k * 1.2); } });
     }
   }
+  const TRAIL = PERF.mobile ? 9 : 14;
+  const TCOL = [];                                     // mobile: 16 pre-built trail colours (no string per segment per frame)
+  for (let i = 0; i <= 16; i++) { const k = i / 16; TCOL.push(`rgba(255,${Math.round(90 + 120 * k)},${Math.round(20 + 60 * k)},${0.15 + 0.6 * k})`); }
+  const trailCol = (k) => TCOL[Math.round(k * 16)];
   // a glowing lava-trail shard: cubic bezier p0 -> p1 with a fading trail; onArrive when it lands
   function shard(x0, y0, x1, y1, o) {
     o = o || {};
@@ -1616,7 +1655,7 @@ const PFX = (() => {
         if (t >= 1) { if (!p.arrived) { p.arrived = true; if (o.onArrive) o.onArrive(); } return p.trail.length > 0 && (p.trail.shift(), p.trail.length > 0); }
         const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
         p.x = bz(e, x0, c1[0], c2[0], x1); p.y = bz(e, y0, c1[1], c2[1], y1);
-        p.trail.push([p.x, p.y]); if (p.trail.length > 14) p.trail.shift();
+        p.trail.push([p.x, p.y]); if (p.trail.length > TRAIL) p.trail.shift();
         return true;
       },
       draw: (p) => {
@@ -1624,7 +1663,7 @@ const PFX = (() => {
         const tr = p.trail;
         for (let i = 1; i < tr.length; i++) {
           const k = i / tr.length;
-          g.strokeStyle = `rgba(255,${Math.round(90 + 120 * k)},${Math.round(20 + 60 * k)},${0.15 + 0.6 * k})`;
+          g.strokeStyle = PERF.mobile ? trailCol(k) : `rgba(255,${Math.round(90 + 120 * k)},${Math.round(20 + 60 * k)},${0.15 + 0.6 * k})`;
           g.lineWidth = 3 + 12 * k; g.lineCap = 'round';
           g.beginPath(); g.moveTo(tr[i - 1][0], tr[i - 1][1]); g.lineTo(tr[i][0], tr[i][1]); g.stroke();
         }
@@ -1643,6 +1682,21 @@ const PFX = (() => {
         draw: (p) => { const k = 1 - p.age / p.life; dot(p.key, p.x, p.y, p.r, Math.min(1, k * 1.6)); } });
     }
   }
+  // mobile coin sprites: the same drawing as below at r = 32, 8 widths from edge-on (0.28) to face-on (1)
+  const COIN = [];
+  function coinSprite(i) {
+    if (COIN[i]) return COIN[i];
+    const r = 32, w = r * (0.28 + 0.72 * i / 7), c = document.createElement('canvas');
+    c.width = Math.ceil(2 * w + 8); c.height = 2 * r + 10;
+    const x = c.getContext('2d'); x.translate(c.width / 2, r + 4);
+    x.fillStyle = '#7a4a06'; x.beginPath(); x.ellipse(0, 2.5, w + 1.5, r + 1.5, 0, 0, Math.PI * 2); x.fill();
+    x.fillStyle = '#e8a91e'; x.beginPath(); x.ellipse(0, 0, w, r, 0, 0, Math.PI * 2); x.fill();
+    x.fillStyle = '#ffd84a'; x.beginPath(); x.ellipse(0, 0, w * 0.76, r * 0.76, 0, 0, Math.PI * 2); x.fill();
+    x.strokeStyle = 'rgba(150,90,10,.85)'; x.lineWidth = 2; x.beginPath(); x.ellipse(0, 0, w * 0.5, r * 0.5, 0, 0, Math.PI * 2); x.stroke();
+    x.fillStyle = 'rgba(160,96,10,.9)'; x.beginPath(); x.moveTo(0, -r * 0.3); x.lineTo(w * 0.22, 0); x.lineTo(0, r * 0.3); x.lineTo(-w * 0.22, 0); x.closePath(); x.fill();
+    x.fillStyle = 'rgba(255,252,215,.8)'; x.beginPath(); x.ellipse(-w * 0.32, -r * 0.4, w * 0.22, r * 0.16, 0, 0, Math.PI * 2); x.fill();
+    return (COIN[i] = c);
+  }
   // gold coins falling from the top of the stage (big wins); drawn opaque with a spinning ellipse
   // (they fall BEHIND the splash type: the canvas sits under #splash, over its dim)
   function coins(n) {
@@ -1653,6 +1707,11 @@ const PFX = (() => {
         step: (p, dt) => ballistic(p, dt) && p.y < H + 60,
         draw: (p) => {
           const c = Math.cos(p.age * p.spin), w = Math.max(0.28, Math.abs(c)) * p.r, r = p.r;   // never thinner than a coin's edge
+          if (PERF.mobile) {                                   // mobile: one drawImage of a pre-rendered coin (8 widths)
+            const sp = coinSprite(Math.max(0, Math.min(7, Math.round((w / r - 0.28) / 0.72 * 7)))), s = r / 32;
+            g.save(); g.translate(p.x, p.y); g.rotate(p.tilt); g.drawImage(sp, -sp.width / 2 * s, -sp.height / 2 * s, sp.width * s, sp.height * s); g.restore();
+            return;
+          }
           g.save(); g.translate(p.x, p.y); g.rotate(p.tilt);
           g.fillStyle = '#7a4a06'; g.beginPath(); g.ellipse(0, 2.5, w + 1.5, r + 1.5, 0, 0, Math.PI * 2); g.fill();      // edge
           g.fillStyle = '#e8a91e'; g.beginPath(); g.ellipse(0, 0, w, r, 0, 0, Math.PI * 2); g.fill();                    // rim
@@ -1749,6 +1808,19 @@ const LampFX = (() => {
       Object.assign(b.style, { width: s + 'px', height: s * 1.2 + 'px', left: G[2] * (0.18 + 0.64 * ((i * 53) % 7) / 6) - s / 2 + 'px', top: G[3] - s * 0.6 + 'px' });
       b.style.setProperty('--d', 6 + (i % 3) * 2.3 + 's'); b.style.setProperty('--dl', -i * 1.7 + 's');
       b.style.setProperty('--h', G[3] * 0.9 + 'px'); b.style.setProperty('--sx', (i % 2 ? -1 : 1) * (4 + i * 2) + 'px');
+      if (PERF.mobile) {
+        /* mobile: the same lfRise track as a Web Animation with resolved px values (transform / opacity only, so it
+           runs on the compositor; the CSS keyframes use var() and are re-styled on the main thread every frame) */
+        if (b._a) b._a.cancel();
+        b.style.animation = 'none';
+        if (CALM_FX()) return;
+        const h = G[3] * 0.9, sx = (i % 2 ? -1 : 1) * (4 + i * 2);
+        const e = 'ease-in-out';                          // per keyframe, like the CSS animation-timing-function
+        b._a = b.animate([{ transform: 'translate(0px,0px) scale(.7)', opacity: 0, offset: 0, easing: e }, { opacity: 0.95, offset: 0.12, easing: e },
+          { transform: `translate(${sx}px,${-h * 0.5}px) scale(1.1)`, offset: 0.5, easing: e }, { opacity: 0.85, offset: 0.88, easing: e },
+          { transform: `translate(0px,${-h}px) scale(.8)`, opacity: 0, offset: 1 }],
+          { duration: (6 + (i % 3) * 2.3) * 1000, delay: -i * 1700, iterations: Infinity });
+      }
     });
     placeMarks();
     Object.assign(tag.style, { left: gx + G[2] / 2 + 'px', top: gy - 6 + 'px' });
@@ -1771,7 +1843,7 @@ const LampFX = (() => {
     // a shard landed: brief flare of the glass and the halo
     pulse() {
       if (CALM_FX() || skipSpin) return;
-      fxEl.animate([{ filter: 'brightness(1.35)' }, { filter: 'brightness(1)' }], { duration: 260, easing: 'ease-out' });
+      if (!PERF.mobile) fxEl.animate([{ filter: 'brightness(1.35)' }, { filter: 'brightness(1)' }], { duration: 260, easing: 'ease-out' });
       halo.animate([{ transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 300, easing: 'ease-out' });
     },
     // heat markers: a new marker flashes white-hot and settles; the full set (free spins) flares all three together
@@ -2068,7 +2140,7 @@ const HeatFX = (() => {
     });
   }
   function surge(k) {
-    if (CALM_FX() || skipSpin) return;
+    if (CALM_FX() || skipSpin || PERF.mobile) return;       // mobile: no brightness filter over the glow layers
     const m = k || 1;
     Object.values(L).forEach((w) => {
       if (!w.firstChild) return;
@@ -2090,7 +2162,8 @@ const HeatFX = (() => {
    prefers-reduced-motion. One additive glow sprite, drawn with 'lighter' inside the canvases only. */
 const EmberFX = (() => {
   const host = { b: $('emBack'), f: $('emFront') };
-  const K = 0.5, MAX = { b: COARSE ? 32 : 75, f: COARSE ? 5 : 12 };   // K: canvas px per stage px
+  const K = PERF.mobile ? 0.4 : 0.5, MAX = { b: PERF.mobile ? 20 : COARSE ? 32 : 75, f: PERF.mobile ? 3 : COARSE ? 5 : 12 };   // K: canvas px per stage px
+  const STEP_MS = PERF.mobile ? 40 : 30;               // redraw interval (mobile ~25 fps)
   const RISE = 330, SIDE = 90;                          // a region reaches this far above / beside its emitters
   let src = { b: [], f: [] }, win = [0, 0, 0, 0], raf = 0, last = 0, acc = { b: 0, f: 0 }, fsBoost = 1;
   let regs = [];                                        // {l, x, y, w, h, cv, g, n, dirty}
@@ -2151,7 +2224,7 @@ const EmberFX = (() => {
   }
   function tick(now) {
     raf = requestAnimationFrame(tick);
-    if (last && now - last < 30) return;                 // ~30 fps is plenty for slow embers (fewer canvas uploads)
+    if (last && now - last < STEP_MS) return;                 // ~30 fps is plenty for slow embers (fewer canvas uploads)
     const dt = Math.min(0.08, (now - (last || now)) / 1000); last = now;
     const t = now / 1000;
     const count = { b: 0, f: 0 };
@@ -2575,10 +2648,22 @@ async function burst(cells, st, er, lmax) {
   });
   await sleep(230);
   sfx.burst(); shake('burst');
-  const per = Math.max(4, Math.min(16, Math.floor((COARSE ? 90 : 220) / cells.length)));
+  const per = Math.max(PERF.mobile ? 3 : 4, Math.min(PERF.mobile ? 10 : 16, Math.floor((PERF.mobile ? 60 : COARSE ? 90 : 220) / cells.length)));
   // ANIM-PLACEHOLDER: symbol-burst (the symbol keeps its colours, glows molten at the edges, swells and shatters)
   const glowA = 'drop-shadow(0 0 0 rgba(255,120,20,0)) brightness(1)', glowB = 'drop-shadow(0 0 16px #ff7a1a) brightness(1.15)', glowC = 'drop-shadow(0 0 26px #ff5000) brightness(.7)';
-  cells.forEach(([r, k]) => {
+  if (PERF.mobile) cells.forEach(([r, k]) => {
+    /* mobile: transform / opacity only (no drop-shadow filter re-rasterised per cell per frame); the molten glow is one
+       radial-gradient disc per cell that swells and fades on the compositor */
+    const c = visCell(r, k);
+    if (c) anim(c, [{ transform: `scale(${KSYM})`, opacity: 1 }, { transform: `scale(${KSYM * 1.14})`, opacity: 1, offset: 0.4 },
+      { transform: `scale(${KSYM * 0.2}) rotate(16deg)`, opacity: 0 }], 380, { fill: 'forwards' });
+    const [x, y, w, h] = cellRect(r, k), R = Math.min(w, h) * 0.62;
+    const gl = document.createElement('div'); gl.className = 'bglow';
+    boxStyle(gl, [x + w / 2 - R, y + h / 2 - R, 2 * R, 2 * R]); fx.appendChild(gl);
+    anim(gl, [{ opacity: 0, transform: 'scale(.5)' }, { opacity: 1, transform: 'scale(1)', offset: 0.4 }, { opacity: 0, transform: 'scale(1.25)' }], 420).then(() => gl.remove());
+    PFX.sparks(CX[r], CY[k], per, { speed: 560, size: 11, jitter: 60 });
+  });
+  else cells.forEach(([r, k]) => {
     const c = visCell(r, k);
     if (c) anim(c, [{ transform: `scale(${KSYM})`, opacity: 1, filter: glowA }, { transform: `scale(${KSYM * 1.14})`, opacity: 1, filter: glowB, offset: 0.4 },
       { transform: `scale(${KSYM * 0.2}) rotate(16deg)`, opacity: 0, filter: glowC }], 380, { fill: 'forwards' });
@@ -3629,6 +3714,23 @@ const QA = (() => {
 if (QA) Object.assign(window.LA_DEBUG, { qaList: QA.list, qaRun: (id) => QA.run(id), qaRunAll: (ids) => QA.runList(ids) });
 
 /* ============================================================================================ views */
+/* mobile letterbox plate: the background drawn once into a 64 px canvas, darkened like the desktop blur(28px)
+   brightness(.3) filter; the browser upscales it smoothly, which reads as the same blur without a full-screen
+   filter layer. Until the background has decoded the bands stay dark. */
+const plateCache = {};
+function platePreview(name) {
+  if (plateCache[name] != null) return plateCache[name];
+  const im = $('plate');
+  if (!im.complete || !im.naturalWidth) { im.addEventListener('load', () => { if (VIEW_NAME !== name || plateCache[name] != null) return; const u = platePreview(name); document.documentElement.style.setProperty('--plate', u ? `url("${u}")` : 'none'); }, { once: true }); return ''; }
+  try {
+    const c = document.createElement('canvas'), w = 64, h = Math.max(1, Math.round(64 * im.naturalHeight / im.naturalWidth));
+    c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.drawImage(im, 0, 0, w, h);
+    g.fillStyle = 'rgba(0,0,0,.7)'; g.fillRect(0, 0, w, h);
+    plateCache[name] = c.toDataURL('image/png');
+  } catch (e) { plateCache[name] = ''; }
+  return plateCache[name];
+}
 const VIEW = (() => {
   let cur = '';
   function setLay(id, file, box) {
@@ -3648,7 +3750,7 @@ const VIEW = (() => {
     ['fx', 'fxTop'].forEach((id) => Object.assign($(id).style, { width: W + 'px', height: H + 'px' }));
     geoFrom(VG);
     setLay('plate', `bg-${s}.webp`, lay('bg') || [0, 0, W, H]);
-    { const u = asset(`bg-${s}.webp`); document.documentElement.style.setProperty('--plate', u ? `url("${u}")` : 'none'); }
+    { const u = PERF.mobile ? platePreview(name) : asset(`bg-${s}.webp`); document.documentElement.style.setProperty('--plate', u ? `url("${u}")` : 'none'); }
     setLay('reelframe', `reelframe-${s}.webp`, lay('reelframe'));
     setLay('fg', `foreground-${s}.webp`, lay('foreground'));
     setLay('logo', `logo-${s}.webp`, lay('logo'));
