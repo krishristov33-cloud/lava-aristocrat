@@ -411,6 +411,8 @@
   html.mperf .cell.pop img{filter:brightness(1.12)}          /* no drop-shadow on the pulsing winners (the rim glows) */
   html.mperf .lf-surf{filter:none}
   html.mperf .lock svg{filter:none}
+  html.mperf canvas.sp-rays,html.mperf canvas.sp-glow{background:none;-webkit-mask-image:none;mask-image:none}
+  html.mperf #plate,html.mperf #reelframe{transition:none}   /* free spins look switches at once (no .8 s filter repaint) */
   .bglow{position:absolute;pointer-events:none;border-radius:50%;opacity:0;
     background:radial-gradient(closest-side,rgba(255,220,140,.9),rgba(255,122,26,.55) 45%,rgba(255,80,0,0) 100%)}
   @keyframes spStart{from{transform:scale(1)}to{transform:scale(1.06)}}
@@ -493,7 +495,7 @@
 <div id="dbg"></div>
 
 <script>/* =========================================================================
-   LAVA ARISTOCRAT NIGHT — math engine (single source of truth, no DOM)
+   LAVA ARISTOCRAT NIGHT \u2014 math engine (single source of truth, no DOM)
    -------------------------------------------------------------------------
    5 reels x 3 rows, 243 ways left to right, CASCADES.
    - A way pays when 3+ ADJACENT reels from reel 1 carry the symbol (or the
@@ -1813,6 +1815,7 @@ const LampFX = (() => {
            runs on the compositor; the CSS keyframes use var() and are re-styled on the main thread every frame) */
         if (b._a) b._a.cancel();
         b.style.animation = 'none';
+        if (i >= 4) { b.style.display = 'none'; return; }   // mobile: 4 blobs (each running one costs style work)
         if (CALM_FX()) return;
         const h = G[3] * 0.9, sx = (i % 2 ? -1 : 1) * (4 + i * 2);
         const e = 'ease-in-out';                          // per keyframe, like the CSS animation-timing-function
@@ -2393,14 +2396,58 @@ const sfx = (() => {
     s.connect(f).connect(g).connect(c.destination); s.start(t); s.stop(t + dur + 0.05);
   }
   let unlocked = false, mi = 0, themeBuf = null, themeSrc = null, themeBusy = false, themeBad = false;
+  /* mobile: the theme STREAMS from an audio element (setSrc, data: URI; CSP media-src data:) routed through a gain
+     node, instead of decodeAudioData's ~70 MB of PCM (203 s x 44.1 kHz x 2 ch x 4 bytes). If the element fails, the
+     fallback decodes at 22 050 Hz and keeps one mono channel (~18 MB). Desktop: the decoded buffer, as before. */
+  let themeEl = null, themeGain = null, streamBad = !PERF.mobile;
+  function themeStreamFail() {
+    if (streamBad) return;
+    streamBad = true;
+    if (themeEl) { try { themeEl.pause(); } catch (e) {} }   // dropped: the element and its stream are collected
+    themeEl = null; themeSrc = null;
+    musicLoop();
+  }
+  function themeStream(u, c) {
+    if (!themeEl) {
+      try {
+        const el = document.createElement('audio');
+        el.loop = true; el.preload = 'auto'; el.setAttribute('playsinline', '');
+        el.addEventListener('error', themeStreamFail);
+        // once it plays, the element owns its copy: drop the page's 3.1 MB base64 string (a later failure = synth loop)
+        el.addEventListener('playing', () => { ASSET[SKIN.music.track] = null; }, { once: true });
+        setSrc(el, u);
+        const n = c.createMediaElementSource(el); themeGain = c.createGain();
+        n.connect(themeGain).connect(c.destination);
+        themeEl = el;
+      } catch (e) { streamBad = true; return false; }
+    }
+    const el = themeEl, t = c.currentTime;
+    themeGain.gain.cancelScheduledValues(t);
+    themeGain.gain.setValueAtTime(0.0001, t); themeGain.gain.exponentialRampToValueAtTime(SKIN.music.volume, t + SKIN.music.fadeIn);
+    const p = el.play(); if (p && p.catch) p.catch(themeStreamFail);
+    themeSrc = { stop() { el.pause(); } };
+    return true;
+  }
+  function decodeSmall(bytes) {                       // mobile fallback: 22 050 Hz, mono
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const o = new OAC(1, 1, 22050);
+    return new Promise((res, rej) => { const p = o.decodeAudioData(bytes.buffer, res, rej); if (p && p.then) p.then(res, rej); }).then((buf) => {
+      const c = ac(), m = c.createBuffer(1, buf.length, buf.sampleRate), d = m.getChannelData(0);
+      const a = buf.getChannelData(0), b = buf.numberOfChannels > 1 ? buf.getChannelData(1) : a;
+      for (let i = 0; i < d.length; i++) d[i] = (a[i] + b[i]) * 0.5;
+      return m;
+    });
+  }
   function themePlay(u) {
     const c = ac(); if (!c) return;
+    if (!streamBad && themeStream(u, c)) return;
     if (!themeBuf) {
       if (themeBusy) return;
       themeBusy = true;
       const bin = atob(u.slice(u.indexOf(',') + 1)), bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      c.decodeAudioData(bytes.buffer).then((buf) => { themeBuf = buf; themeBusy = false; musicLoop(); }, () => { themeBad = true; themeBusy = false; musicLoop(); });
+      (PERF.mobile && (window.OfflineAudioContext || window.webkitOfflineAudioContext) ? decodeSmall(bytes) : c.decodeAudioData(bytes.buffer))
+        .then((buf) => { themeBuf = buf; themeBusy = false; musicLoop(); }, () => { themeBad = true; themeBusy = false; musicLoop(); });
       return;
     }
     const s = c.createBufferSource(), g = c.createGain(), t = c.currentTime;
@@ -2410,6 +2457,7 @@ const sfx = (() => {
   }
   function musicLoop() {
     if (musicTimer || themeSrc || !musicOn || document.hidden || !unlocked) return;
+    if (themeEl && !streamBad) { const c = ac(); if (c) themeStream(null, c); return; }   // mobile stream: resume the element
     const theme = !themeBad && asset(SKIN.music.track);
     if (theme) { themePlay(theme); return; }
     const notes = [110, 110, 146.8, 130.8, 110, 98, 110, 164.8];
@@ -2895,12 +2943,40 @@ function spFinishIntro() {                    // finish every finite entrance an
     try { const t = a.effect && a.effect.getComputedTiming(); if (t && Number.isFinite(t.endTime)) a.finish(); } catch (e) {}
   });
 }
+/* mobile splash backdrop: the rays (masked conic gradient, 1700 px) and the glow (1300 px radial) drawn once per
+   splash into small canvases (600 / 256 px, CSS-scaled, mask baked in) that ride the same CSS animations: no
+   1700 px mask layer, ~1.7 MB instead of ~35 MB of layers at 3x. Created on open, dropped with the splash. */
+function spCanvas(kind) {
+  const c = document.createElement('canvas'), S = kind === 'rays' ? 600 : 256, R = S / 2;
+  c.width = c.height = S; c.className = kind === 'rays' ? 'sp-rays' : 'sp-glow';
+  const g = c.getContext('2d');
+  if (kind === 'rays') {
+    const D = Math.PI / 180;
+    g.translate(R, R);
+    const wedge = (a, b, al) => { g.fillStyle = `rgba(255,200,120,${al})`; g.beginPath(); g.moveTo(0, 0); g.arc(0, 0, R, a * D, b * D); g.closePath(); g.fill(); };
+    for (let i = 0; i < 15; i++) {                      // repeating-conic-gradient: .38 for 0-6 deg, ramps 6-9 / 21-24, period 24
+      const a = i * 24 - 90;
+      wedge(a, a + 6, 0.38); wedge(a + 6, a + 7.5, 0.25); wedge(a + 7.5, a + 9, 0.12); wedge(a - 3, a - 1.5, 0.12); wedge(a - 1.5, a, 0.25);
+    }
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'destination-in';     // the radial mask: #000 15%, .5 at 55%, transparent at the edge
+    const m = g.createRadialGradient(R, R, 0, R, R, R);
+    m.addColorStop(0, 'rgba(0,0,0,1)'); m.addColorStop(0.15, 'rgba(0,0,0,1)'); m.addColorStop(0.55, 'rgba(0,0,0,.5)'); m.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = m; g.fillRect(0, 0, S, S);
+  } else {
+    const m = g.createRadialGradient(R, R, 0, R, R, R);
+    m.addColorStop(0, 'rgba(255,180,60,.75)'); m.addColorStop(0.4, 'rgba(255,80,10,.4)'); m.addColorStop(0.65, 'rgba(160,20,0,.15)'); m.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = m; g.fillRect(0, 0, S, S);
+  }
+  return c;
+}
 function spOpen(dim) {
   skipSpin = false;
   spStage.textContent = ''; spRoot.className = 'on'; spDim.classList.add('on'); spSync();
   spDim.style.setProperty('--spDim', dim == null ? 0.72 : dim);
   splashTap = spFinishIntro; bannerSkip = spFinishIntro;
-  spEl(spStage, 'div', 'sp-rays'); spEl(spStage, 'div', 'sp-glow');
+  if (PERF.mobile) { spStage.appendChild(spCanvas('rays')); spStage.appendChild(spCanvas('glow')); }   // removed with the splash
+  else { spEl(spStage, 'div', 'sp-rays'); spEl(spStage, 'div', 'sp-glow'); }
   const w = spEl(spStage, 'div', 'sp-wrap');
   clearInterval(emberTimer);
   const [W, H] = VG.stage;
@@ -3066,12 +3142,12 @@ async function triggerCelebration(trigs, F) {
   clearWins();
   sfx.trigger(); shake('trigger'); CharFX.react('mega'); HeatFX.surge(1); EmberFX.burst(COARSE ? 24 : 60);
   if (bys.has('lamp')) {
-    prompt(bys.has('scatter') ? 'LAMP + FOUNTAINS — DOUBLE FREE SPINS!' : 'THE LAMP BOILED OVER — FREE SPINS!', 'gold');
+    prompt(bys.has('scatter') ? 'LAMP + FOUNTAINS \u2014 DOUBLE FREE SPINS!' : 'THE LAMP BOILED OVER \u2014 FREE SPINS!', 'gold');
     LampFX.heat(HEAT_MAX, true);
     const [x, y] = LampFX.top(); PFX.sparks(x, y, COARSE ? 30 : 60, { up: true, speed: 1000, size: 12 });
   }
   if (!bys.has('lamp') || bys.has('scatter')) {
-    if (!bys.has('lamp')) prompt(by === 'buy' ? 'BONUS BOUGHT — FREE SPINS!' : 'LAVA FOUNTAINS — FREE SPINS!', 'gold');
+    if (!bys.has('lamp')) prompt(by === 'buy' ? 'BONUS BOUGHT \u2014 FREE SPINS!' : 'LAVA FOUNTAINS \u2014 FREE SPINS!', 'gold');
     for (let r = 0; r < 5; r++) for (let k = 0; k < 3; k++) if (state.grid[r] && state.grid[r][k] === SCAT) {
       const c = visCell(r, k); if (c) c.classList.add('schit');
       PFX.sparks(CX[r], CY[k], COARSE ? 12 : 22, { up: true, speed: 700, size: 12 });
@@ -3132,7 +3208,7 @@ async function playOne(manual, buy) {
   if (busy) return 'busy';
   const betC = toC(bet), costC = buy ? Math.round(betC * BUY_COST) : betC;
   if (balanceC < costC) {
-    prompt('INSUFFICIENT BALANCE — LOWER THE BET', 'alert');
+    prompt('INSUFFICIENT BALANCE \u2014 LOWER THE BET', 'alert');
     toast('Insufficient balance', `Balance ${fmt(balanceC)} EUR is below the ${fmt(costC)} EUR ${buy ? 'bonus price' : 'bet'}.`, 2600);
     setWin(0);
     return 'funds';
@@ -3142,7 +3218,7 @@ async function playOne(manual, buy) {
   if (manual) closeMenus();
   balanceC -= costC; sessionBetC += costC;
   setWin(0); clearWins();
-  prompt(buy ? 'BONUS BOUGHT — GOOD LUCK!' : 'GOOD LUCK!');
+  prompt(buy ? 'BONUS BOUGHT \u2014 GOOD LUCK!' : 'GOOD LUCK!');
   hud();
   const opts = {};
   if (buy) opts.buy = true;
@@ -3167,7 +3243,7 @@ async function playOne(manual, buy) {
     const F = round.feature;
     if (F) {
       ctx.cumX = round.base.totalX || ctx.cumX;
-      if (autoplay) stopAuto('Autoplay OFF — Free Spins');            // autoplay stops on a feature: the player presses START
+      if (autoplay) stopAuto('Autoplay OFF \u2014 Free Spins');            // autoplay stops on a feature: the player presses START
       await triggerCelebration(res.triggers, F);
       MultFX.reset();
       const bys = new Set(res.triggers.map((t) => t.by));
@@ -3216,7 +3292,7 @@ async function autoLoop(gen) {
     if (!(autoplay && gen === autoGen)) return;
     const r = await playOne();
     if (gen !== autoGen || !autoplay) return;
-    if (r === 'funds') { stopAuto('Autoplay OFF — balance too low'); return; }
+    if (r === 'funds') { stopAuto('Autoplay OFF \u2014 balance too low'); return; }
     if (r === 'busy') { await new Promise((res) => setTimeout(res, 60)); continue; }
     await new Promise((res) => setTimeout(res, 380 * (speedMode === 'turbo' ? 0.5 : 1)));
   }
@@ -3321,7 +3397,7 @@ function openBuy() {
   const yes = document.createElement('div'); yes.className = 'pbtn'; yes.textContent = 'BUY'; yes.setAttribute('role', 'button');
   const no = document.createElement('div'); no.className = 'pbtn alt'; no.textContent = 'CANCEL'; no.setAttribute('role', 'button');
   row.appendChild(yes); row.appendChild(no);
-  if (balanceC < cost) { el('div', 'note', `Balance ${fmt(balanceC)} EUR is too low for this bet — lower the bet first.`); yes.classList.add('alt'); }
+  if (balanceC < cost) { el('div', 'note', `Balance ${fmt(balanceC)} EUR is too low for this bet \u2014 lower the bet first.`); yes.classList.add('alt'); }
   yes.onclick = () => { if (balanceC < cost) return; sfx.click(); closeMenus(); playOne(true, true); };
   no.onclick = () => { sfx.click(); closeMenus(); };
   p.classList.add('on'); $('scrim').classList.add('on');
@@ -3336,7 +3412,7 @@ function toggleFullscreen() {
   const root = document.documentElement, d = document;
   const on = d.fullscreenElement || d.webkitFullscreenElement;
   const req = on ? (d.exitFullscreen || d.webkitExitFullscreen) : (root.requestFullscreen || root.webkitRequestFullscreen);
-  if (!req) { toast(/iPhone|iPod/.test(navigator.userAgent) ? 'iPhone: Share → Add to Home Screen for full screen' : 'Fullscreen not available here', null, 2600); return; }
+  if (!req) { toast(/iPhone|iPod/.test(navigator.userAgent) ? 'iPhone: Share \u2192 Add to Home Screen for full screen' : 'Fullscreen not available here', null, 2600); return; }
   try { const p = req.call(on ? d : root); if (p && p.catch) p.catch(() => toast('Fullscreen not available here', null, 1400)); }
   catch (e) { toast('Fullscreen not available here', null, 1400); }
 }
@@ -3383,10 +3459,10 @@ function renderRules() {
   const r = $('rules'); r.textContent = '';
   const el = (tag, cls, txt, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; (parent || r).appendChild(e); return e; };
   const x = el('button', 'x', '×'); x.onclick = closeMenus;
-  el('h2', '', `${SKIN.title} — RULES & PAYTABLE`);
+  el('h2', '', `${SKIN.title} \u2014 RULES & PAYTABLE`);
   el('div', 'head', `RTP ${RTP_TXT} · max win ${String(MAX_WIN).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')}× bet · high volatility`);
   el('div', 'note', `Pays are multiples of the TOTAL bet for each way; at the current bet of ${fmtBet(bet)} EUR the amount is shown under each pay. Values are read live from the engine.`);
-  el('h3', '', 'Paytable — 3 / 4 / 5 of a kind, per way');
+  el('h3', '', 'Paytable \u2014 3 / 4 / 5 of a kind, per way');
   const g = el('div', 'pays');
   const PT = SP.PAYTABLE || {};
   const order = SYMS.filter((s) => PT[s]).sort((a, b) => (PT[b][2] || 0) - (PT[a][2] || 0));
@@ -3400,13 +3476,13 @@ function renderRules() {
   el('b', '', ['3', '4', '5'].filter((n) => SPY[n] != null).map((n) => `${n}× ${SPY[n]}`).join('  ·  ') || 'SCATTER', sp);
   el('span', '', `${LABEL[SCAT]} · pays anywhere (× bet) · 3+ = ${FS_AWARD} free spins`, sp);
   const wp = el('div', 'pay', null, g); el('div', 'ic', null, wp).appendChild(makeCell(WILD));
-  el('b', '', 'WILD', wp); el('span', '', `${LABEL[WILD]} · lands on reels 2–5 only · substitutes for every symbol except the scatter`, wp);
+  el('b', '', 'WILD', wp); el('span', '', `${LABEL[WILD]} · lands on reels 2\u20135 only · substitutes for every symbol except the scatter`, wp);
   const lk = el('div', 'pay', null, g); el('div', 'ic', null, lk).appendChild(makeCell(LOCK));
   el('b', '', 'LAVA LOCK', lk); el('span', '', 'Floor Wipe fragment · never pays', lk);
   el('h3', '', '243 ways');
   el('div', '', 'Five reels, three rows, 243 ways. A win is the same symbol (or the wild) on adjacent reels from the leftmost reel, at least 3 reels long. Every combination of positions on those reels is a way: the win pays the symbol\'s pay times the number of ways. Only the highest win per symbol pays; wins of different symbols add up.');
   el('h3', '', 'Cascades');
-  el('div', '', 'Winning symbols crack and burst; the symbols above fall into the gaps and new symbols drop in from above. The new screen is evaluated again, and the chain goes on until a screen has no win. One spin can chain many cascades — every one of them is paid. A reel never holds more than one Lava Fountain; fountains are never cleared by a cascade and are counted on the screen where the chain ends.');
+  el('div', '', 'Winning symbols crack and burst; the symbols above fall into the gaps and new symbols drop in from above. The new screen is evaluated again, and the chain goes on until a screen has no win. One spin can chain many cascades \u2014 every one of them is paid. A reel never holds more than one Lava Fountain; fountains are never cleared by a cascade and are counted on the screen where the chain ends.');
   el('h3', '', 'The lava lamp');
   el('div', '', `Every winning cascade pours lava into the lava lamp: 1 unit per cleared symbol, +2 for every chained cascade after the first. When the lamp holds ${LAMP_MAX} units it ERUPTS at the end of that cascade: the eruption melts every low symbol (J, Q, K, A) and every lava fragment, the next cascade is guaranteed to win, and the galaxy map unrolls to reveal a multiplier of 2×, 3×, 4×, 5× or 10× (rarely 25× or 50×). The multiplier applies to every win from that guaranteed cascade to the end of the spin, scatter pays included (the wins of the cascade that filled the lamp are paid without it); several eruptions in one spin add up.`);
   el('div', '', `HEAT: each base game eruption lights one of the ${HEAT_MAX} heat markers on the lamp glass's measuring scale, bottom one first (they glow molten orange and the lamp burns hotter: red, orange, white-hot; separate from the lava units); when all ${HEAT_MAX} are lit, the lamp boils over and awards ${FS_AWARD} free spins. Scatters and a full set of heat markers award together: both in one spin = ${FS_AWARD * 2} free spins.`);
@@ -3419,17 +3495,17 @@ function renderRules() {
   el('div', '', `The Buy Bonus button starts the free spins straight away for ${BUY_COST}× the bet (${fmt(Math.round(toC(bet) * BUY_COST))} EUR at the current bet). The bought spin lands 3 Lava Fountains and pays its own wins; it neither fills nor empties your lamp and heat markers.`);
   el('h3', '', 'Limits');
   const RS = SP.RTP_SHEET || {};
-  const pc = (v) => (v == null ? '—' : (v > 1 ? v : v * 100).toFixed(2) + '%');
+  const pc = (v) => (v == null ? '\u2014' : (v > 1 ? v : v * 100).toFixed(2) + '%');
   el('div', '', `A round (the spin, its cascades and the whole feature) pays at most ${MAX_WIN}× the bet; reaching it ends the round. RTP ${RTP_TXT} (Buy Bonus ${RS.buyRtp ? pc(RS.buyRtp).replace(/(\.\d)\d%/, '$1%') : RTP_TXT}). High volatility. Malfunction voids all pays.`);
   const dev = el('table', 'dev');
-  const pts = (v) => (v == null ? '—' : (v * 100).toFixed(2) + ' RTP pts');
-  [['Measured (engine sim, ' + (RS.rounds ? (RS.rounds / 1e9).toFixed(1) + '×10⁹ rounds' : 'Monte-Carlo') + ')', 'Value'],
-    ['RTP', RS.rtp ? pc(RS.rtp) + (RS.rtpSE ? ' ± ' + (RS.rtpSE * 100).toFixed(2) : '') : '—'],
+  const pts = (v) => (v == null ? '\u2014' : (v * 100).toFixed(2) + ' RTP pts');
+  [['Measured (engine sim, ' + (RS.rounds ? (RS.rounds / 1e9).toFixed(1) + '×10\u2079 rounds' : 'Monte-Carlo') + ')', 'Value'],
+    ['RTP', RS.rtp ? pc(RS.rtp) + (RS.rtpSE ? ' ± ' + (RS.rtpSE * 100).toFixed(2) : '') : '\u2014'],
     ['Base game wins (no multiplier)', pts(RS.base)], ['Eruption-multiplied wins', pts(RS.eruption)], ['Free spins', pts(RS.freeSpins)], ['Hit frequency', pc(RS.hit)],
-    ['Free spins frequency', RS.fsFreq ? (RS.fsFreq > 1 ? '1 in ' + Math.round(RS.fsFreq) : '1 in ' + Math.round(1 / RS.fsFreq)) : '—'], ['Max win', MAX_WIN + '× bet']]
+    ['Free spins frequency', RS.fsFreq ? (RS.fsFreq > 1 ? '1 in ' + Math.round(RS.fsFreq) : '1 in ' + Math.round(1 / RS.fsFreq)) : '\u2014'], ['Max win', MAX_WIN + '× bet']]
     .forEach((row, i) => { const tr = el('tr', '', null, dev); row.forEach((c) => el(i ? 'td' : 'th', '', c, tr)); });
   el('h3', '', 'Controls');
-  el('div', 'note', 'Spin: big button or Space. While a round plays, Space / the spin button / a tap on the reels skip to the end of the spin. Hold the big button or Space for continuous turbo spins. ▶▶▶▶ pill (or T): turbo on / off (halves every timing). Green button (or A): autoplay. Coins button / BET pill: bet menu; – / + step the bet. Keyboard: ← / → bet · B bet menu · T turbo · A autoplay · I rules · M music · S sound · Esc close · D simulator · G debug overlay.');
+  el('div', 'note', 'Spin: big button or Space. While a round plays, Space / the spin button / a tap on the reels skip to the end of the spin. Hold the big button or Space for continuous turbo spins. \u25b6\u25b6\u25b6\u25b6 pill (or T): turbo on / off (halves every timing). Green button (or A): autoplay. Coins button / BET pill: bet menu; \u2013 / + step the bet. Keyboard: \u2190 / \u2192 bet · B bet menu · T turbo · A autoplay · I rules · M music · S sound · Esc close · D simulator · G debug overlay.');
 }
 
 /* ===================================================================================== QA: simulator */
@@ -3463,7 +3539,7 @@ function paintSim(a, N) {
   const RS = SP.RTP_SHEET || {};
   const pct = (x) => (x * 100).toFixed(2) + '%', sh = (v) => (v == null ? '' : v > 1 ? v.toFixed(2) + '%' : pct(v));
   const rows = [['RTP', pct(a.win / a.n), sh(RS.rtp)], ['base part (RTP pts)', pct(a.base / a.n), ''], ['feature part (RTP pts)', pct(a.feat / a.n), ''],
-    ['base hit rate', pct(a.hits / a.n), sh(RS.hit)], ['free spins', a.fs ? '1 in ' + (a.n / a.fs).toFixed(1) : '—', RS.fsFreq ? '1 in ' + (RS.fsFreq > 1 ? RS.fsFreq : 1 / RS.fsFreq).toFixed(0) : ''],
+    ['base hit rate', pct(a.hits / a.n), sh(RS.hit)], ['free spins', a.fs ? '1 in ' + (a.n / a.fs).toFixed(1) : '\u2014', RS.fsFreq ? '1 in ' + (RS.fsFreq > 1 ? RS.fsFreq : 1 / RS.fsFreq).toFixed(0) : ''],
     ['max win', a.max.toFixed(2) + '×', MAX_WIN + '× cap'], ['capped rounds', String(a.capped), '']];
   const secs = ((performance.now() - a.t0) / 1000).toFixed(1);
   $('simOut').innerHTML = `<table><tr><td>${a.n.toLocaleString()} / ${N.toLocaleString()} rounds</td><td>measured</td><td>sheet</td></tr>` +
@@ -3677,11 +3753,11 @@ const QA = (() => {
   const btn = document.createElement('div'); btn.id = 'qaBtn'; btn.textContent = 'QA'; btn.title = 'QA scenarios (Q)';
   document.body.appendChild(panel); document.body.appendChild(btn);
   const el = (tag, cls, txt, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; (parent || panel).appendChild(e); return e; };
-  el('h4', '', 'LAVA ARISTOCRAT — QA SCENARIOS');
+  el('h4', '', 'LAVA ARISTOCRAT \u2014 QA SCENARIOS');
   const bar = el('div', 'qa-bar');
   const recSel = el('select', '', null, bar);
   [['', 'no recording'], ['each', 'record: one video per scenario'], ['one', 'record: one video for the run']].forEach(([v, t]) => { const o = el('option', '', t, recSel); o.value = v; });
-  const bAll = el('button', 'qa-go', '▶ play all', bar), bStop = el('button', '', '■ stop', bar);
+  const bAll = el('button', 'qa-go', '\u25b6 play all', bar), bStop = el('button', '', '\u25a0 stop', bar);
   const status = el('div', 'qa-status', 'Pick a scenario. Rounds are seed-searched to match; splashes continue by themselves.');
   const groups = {};
   ALL.forEach((sc) => {
@@ -3696,7 +3772,7 @@ const QA = (() => {
     let endOne = null;
     try {
       if (mode === 'one') { const st = await capture(); panel.classList.remove('on'); btn.style.display = 'none'; await wait(500); endOne = record(st); }
-      status.textContent = 'running ' + ids.length + ' scenario(s)…';
+      status.textContent = 'running ' + ids.length + ' scenario(s)\u2026';
       const out = await runList(ids, mode === 'each' ? 'each' : null, (o) => { status.textContent = `${o.id}: ${o.ok ? (o.hit === false ? 'played, predicate not met' : 'ok') : 'FAILED ' + (o.err || '')}`; });
       if (endOne) save(await endOne(), `lava-aristocrat-${VIEW_NAME}-qa-run-${stamp()}.webm`);
       const bad = (out || []).filter((o) => !o.ok || o.hit === false);
@@ -3705,7 +3781,7 @@ const QA = (() => {
     finally { btn.style.display = ''; }
   }
   bAll.onclick = () => go(ALL.map((s) => s.id));
-  bStop.onclick = () => { stopAll = true; status.textContent = 'stopping after the current scenario…'; };
+  bStop.onclick = () => { stopAll = true; status.textContent = 'stopping after the current scenario\u2026'; };
   const toggle = () => { if (running) { stopAll = true; panel.classList.add('on'); return; } panel.classList.toggle('on'); };
   btn.addEventListener('click', toggle);
   document.addEventListener('keydown', (e) => { if ((e.key === 'q' || e.key === 'Q') && !(e.target && /INPUT|SELECT|TEXTAREA/.test(e.target.tagName))) toggle(); });
